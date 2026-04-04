@@ -45,7 +45,7 @@ export default function InterviewScreen({ config, onComplete }: InterviewScreenP
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
-  const recognitionRef = useRef<SpeechRecognitionEvent | null>(null);
+  const recognitionRef = useRef<any | null>(null);
   const synthRef = useRef<SpeechSynthesis | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   // AI ko beech mein rokne ke liye
@@ -107,7 +107,7 @@ export default function InterviewScreen({ config, onComplete }: InterviewScreenP
   }, [qaPairs, aiResponse]);
 
   const initSpeechRecognition = () => {
-    const SpeechRecognition = window.SpeechRecognition || (window as any).webkitSpeechRecognition;
+    const SpeechRecognition =  (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SpeechRecognition) return;
     const recognition = new SpeechRecognition();
     recognition.continuous = false;
