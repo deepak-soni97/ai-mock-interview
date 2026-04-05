@@ -3,24 +3,43 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { InterviewConfig } from "../page";
 
-interface Message {
-  role: "user" | "assistant";
-  content: string;
+interface Message { role: "user" | "assistant"; content: string; }
+interface QAPair { question: string; answer: string; score: number | null; timestamp: number; }
+
+// Voices async loader — browser mein pehli baar getVoices() empty hota hai
+function getVoiceAsync(): Promise<SpeechSynthesisVoice | null> {
+  return new Promise((resolve) => {
+    const synth = window.speechSynthesis;
+    const voices = synth.getVoices();
+    if (voices.length > 0) {
+      const preferred =
+        voices.find((v) => v.name.includes("Google") && v.lang === "en-US") ||
+        voices.find((v) => v.lang.startsWith("en")) ||
+        voices[0];
+      return resolve(preferred || null);
+    }
+    let resolved = false;
+    synth.onvoiceschanged = () => {
+      if (resolved) return;
+      resolved = true;
+      const v2 = synth.getVoices();
+      const preferred =
+        v2.find((v) => v.name.includes("Google") && v.lang === "en-US") ||
+        v2.find((v) => v.lang.startsWith("en")) ||
+        v2[0];
+      resolve(preferred || null);
+    };
+    setTimeout(() => { if (!resolved) { resolved = true; resolve(null); } }, 3000);
+  });
 }
 
-interface QAPair {
-  question: string;
-  answer: string;
-  score: number | null;
-  timestamp: number;
-}
-
-interface InterviewScreenProps {
+export default function InterviewScreen({
+  config,
+  onComplete,
+}: {
   config: InterviewConfig;
   onComplete: (messages: Message[]) => void;
-}
-
-export default function InterviewScreen({ config, onComplete }: InterviewScreenProps) {
+}) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isListening, setIsListening] = useState(false);
   const [isAISpeaking, setIsAISpeaking] = useState(false);
@@ -31,50 +50,81 @@ export default function InterviewScreen({ config, onComplete }: InterviewScreenP
   const [status, setStatus] = useState("INITIALIZING...");
   const [qaPairs, setQAPairs] = useState<QAPair[]>([]);
   const [currentQuestion, setCurrentQuestion] = useState("");
-  const [pendingAnswer, setPendingAnswer] = useState(""); // User ka full answer collect karo
-  const [answerReady, setAnswerReady] = useState(false); // Submit button dikhane ke liye
+  const [pendingAnswer, setPendingAnswer] = useState("");
+  const [answerReady, setAnswerReady] = useState(false);
+  const [submitError, setSubmitError] = useState("");
+  const [silenceWarning, setSilenceWarning] = useState(false);
 
-  // Timer
   const [timeLeft, setTimeLeft] = useState(config.timeLimit * 60);
   const [timerActive, setTimerActive] = useState(false);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const SILENCE_TIMEOUT = 10000;
 
-  // Camera
   const [cameraOn, setCameraOn] = useState(false);
   const [cameraError, setCameraError] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
-  const recognitionRef = useRef<any | null>(null);
+  const recognitionRef = useRef<any>(null);
   const synthRef = useRef<SpeechSynthesis | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  // AI ko beech mein rokne ke liye
   const abortSpeakRef = useRef(false);
-  // Next question shuru hone se rokne ke liye
-  const waitingForSubmitRef = useRef(false);
+  const lastSpokenTextRef = useRef("");
+  const isCompletingRef = useRef(false);
 
   const totalSeconds = config.timeLimit * 60;
   const timePercent = (timeLeft / totalSeconds) * 100;
   const scoredPairs = qaPairs.filter((q) => q.score !== null);
-  const avgScore = scoredPairs.length > 0
-    ? Math.round(scoredPairs.reduce((a, b) => a + (b.score ?? 0), 0) / scoredPairs.length)
-    : 0;
+  const avgScore =
+    scoredPairs.length > 0
+      ? Math.round(scoredPairs.reduce((a, b) => a + (b.score ?? 0), 0) / scoredPairs.length)
+      : 0;
 
+  // ── Timer ──
   useEffect(() => {
     if (timerActive && timeLeft > 0) {
       timerRef.current = setInterval(() => {
         setTimeLeft((t) => {
-          if (t <= 1) {
-            clearInterval(timerRef.current!);
-            handleTimeUp();
-            return 0;
-          }
+          if (t <= 1) { clearInterval(timerRef.current!); handleTimeUp(); return 0; }
           return t - 1;
         });
       }, 1000);
     }
     return () => clearInterval(timerRef.current!);
   }, [timerActive]);
+
+  // ── Init ──
+  useEffect(() => {
+    synthRef.current = window.speechSynthesis;
+    // Preload voices
+    synthRef.current.getVoices();
+    if (synthRef.current.onvoiceschanged !== undefined) {
+      synthRef.current.onvoiceschanged = () => synthRef.current?.getVoices();
+    }
+    initSpeechRecognition();
+    startInterview();
+    return () => {
+      synthRef.current?.cancel();
+      recognitionRef.current?.abort();
+      stopCamera();
+      clearSilenceTimer();
+      clearInterval(timerRef.current!);
+    };
+  }, []);
+
+  // ── Camera stream connect ──
+  useEffect(() => {
+    if (cameraOn && videoRef.current && streamRef.current) {
+      videoRef.current.srcObject = streamRef.current;
+      videoRef.current.play().catch(() => {});
+    }
+  }, [cameraOn]);
+
+  // ── Auto scroll ──
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [qaPairs, aiResponse]);
 
   const handleTimeUp = () => {
     synthRef.current?.cancel();
@@ -83,75 +133,52 @@ export default function InterviewScreen({ config, onComplete }: InterviewScreenP
     setTimeout(() => onComplete(messages), 1500);
   };
 
-  useEffect(() => {
-    synthRef.current = window.speechSynthesis;
-    initSpeechRecognition();
-    startInterview();
-    return () => {
-      synthRef.current?.cancel();
-      recognitionRef.current?.abort();
-      stopCamera();
-    };
-  }, []);
+  const clearSilenceTimer = () => {
+    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+    setSilenceWarning(false);
+  };
 
-  // Camera fix — useEffect se video stream connect karo
-  useEffect(() => {
-    if (cameraOn && videoRef.current && streamRef.current) {
-      videoRef.current.srcObject = streamRef.current;
-      videoRef.current.play().catch(() => {});
-    }
-  }, [cameraOn]);
-
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [qaPairs, aiResponse]);
+  const startSilenceTimer = () => {
+    clearSilenceTimer();
+    silenceTimerRef.current = setTimeout(() => setSilenceWarning(true), SILENCE_TIMEOUT);
+  };
 
   const initSpeechRecognition = () => {
-    const SpeechRecognition =  (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRecognition) return;
-    const recognition = new SpeechRecognition();
+    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SR) return;
+    const recognition = new SR();
     recognition.continuous = false;
     recognition.interimResults = true;
     recognition.lang = "en-US";
 
-    recognition.onresult = (event) => {
+    recognition.onresult = (event: any) => {
+      clearSilenceTimer();
+      setSilenceWarning(false);
       const result = event.results[event.results.length - 1];
       const text = result[0].transcript;
       setTranscript(text);
       if (result.isFinal) {
-        // Answer collect karo, submit mat karo abhi
-        setPendingAnswer((prev) => (prev ? prev + " " + text : text));
+        setPendingAnswer((prev) => (prev ? prev + " " + text : text).trim());
         setTranscript("");
         setIsListening(false);
         setAnswerReady(true);
-        waitingForSubmitRef.current = true;
-        setStatus("ANSWER READY — PRESS SUBMIT OR ADD MORE");
+        setStatus("ANSWER READY — SUBMIT OR KEEP ADDING");
       }
     };
-    recognition.onerror = () => {
-      setIsListening(false);
-      if (pendingAnswer) setAnswerReady(true);
-    };
-    recognition.onend = () => setIsListening(false);
+    recognition.onerror = () => { setIsListening(false); clearSilenceTimer(); };
+    recognition.onend = () => { setIsListening(false); };
     recognitionRef.current = recognition;
   };
 
+  // ── Camera ──
   const toggleCamera = async () => {
-    if (cameraOn) {
-      stopCamera();
-    } else {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: "user" },
-          audio: false,
-        });
-        streamRef.current = stream;
-        setCameraOn(true);
-        setCameraError(false);
-      } catch {
-        setCameraError(true);
-      }
-    }
+    if (cameraOn) { stopCamera(); return; }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" }, audio: false });
+      streamRef.current = stream;
+      setCameraOn(true);
+      setCameraError(false);
+    } catch { setCameraError(true); }
   };
 
   const stopCamera = () => {
@@ -160,16 +187,24 @@ export default function InterviewScreen({ config, onComplete }: InterviewScreenP
     setCameraOn(false);
   };
 
-  // AI ko beech mein rokna
+  // ── AI Stop ──
   const stopAI = () => {
     abortSpeakRef.current = true;
     synthRef.current?.cancel();
     setIsAISpeaking(false);
-    setStatus("AI STOPPED — YOUR TURN");
+    setStatus("YOUR TURN — SPEAK OR TYPE");
   };
 
+  // ── Replay last question ──
+  const replayQuestion = () => {
+    if (lastSpokenTextRef.current && !isAISpeaking && !isLoading) {
+      speak(lastSpokenTextRef.current);
+    }
+  };
+
+  // ── Speak — fixed voice loading ──
   const speak = useCallback((text: string): Promise<void> => {
-    return new Promise((resolve) => {
+    return new Promise(async (resolve) => {
       if (!synthRef.current) return resolve();
       abortSpeakRef.current = false;
       synthRef.current.cancel();
@@ -177,75 +212,93 @@ export default function InterviewScreen({ config, onComplete }: InterviewScreenP
       const cleanText = text.replace(/INTERVIEW_COMPLETE/g, "").trim();
       if (!cleanText) return resolve();
 
+      lastSpokenTextRef.current = cleanText;
+
+      // Wait for voices to be ready
+      const voice = await getVoiceAsync();
+
       const utterance = new SpeechSynthesisUtterance(cleanText);
-      const voices = synthRef.current.getVoices();
-      const preferred =
-        voices.find((v) => v.name.includes("Google") && v.lang === "en-US") ||
-        voices.find((v) => v.lang === "en-US") ||
-        voices[0];
-      if (preferred) utterance.voice = preferred;
-      utterance.rate = 0.95;
+      if (voice) utterance.voice = voice;
+      utterance.rate = 0.92;
       utterance.pitch = 0.85;
       utterance.volume = 1;
 
+      let checkInterval: ReturnType<typeof setInterval>;
+      let finished = false;
+
+      const done = () => {
+        if (finished) return;
+        finished = true;
+        clearInterval(checkInterval);
+        setIsAISpeaking(false);
+        resolve();
+      };
+
       utterance.onstart = () => setIsAISpeaking(true);
-      utterance.onend = () => {
-        setIsAISpeaking(false);
-        resolve();
-      };
-      utterance.onerror = () => {
-        setIsAISpeaking(false);
-        resolve();
-      };
+      utterance.onend = done;
+      utterance.onerror = done;
 
-      synthRef.current.speak(utterance);
-
-      // Abort check
-      const checkAbort = setInterval(() => {
+      checkInterval = setInterval(() => {
         if (abortSpeakRef.current) {
           synthRef.current?.cancel();
-          clearInterval(checkAbort);
-          setIsAISpeaking(false);
-          resolve();
+          done();
         }
       }, 100);
 
-      utterance.onend = () => {
-        clearInterval(checkAbort);
-        setIsAISpeaking(false);
-        resolve();
-      };
+      synthRef.current.speak(utterance);
+
+      // Chrome bug — if speech doesn't start in 1.5s, retry
+      setTimeout(() => {
+        if (!finished && !synthRef.current?.speaking) {
+          synthRef.current?.cancel();
+          const u2 = new SpeechSynthesisUtterance(cleanText);
+          if (voice) u2.voice = voice;
+          u2.rate = 0.92; u2.pitch = 0.85; u2.volume = 1;
+          u2.onstart = () => setIsAISpeaking(true);
+          u2.onend = done;
+          u2.onerror = done;
+          synthRef.current?.speak(u2);
+        }
+      }, 1500);
     });
   }, []);
 
+  // ── Score answer ──
   const scoreAnswer = async (question: string, answer: string): Promise<number> => {
+    if (!answer || answer.trim().length < 5) return 0;
     try {
       const res = await fetch("/api/interview", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question, answer }),
+        body: JSON.stringify({ question, answer, level: config.level }),
       });
       const data = await res.json();
-      return data.score ?? 60;
-    } catch {
-      return 60;
-    }
+      return data.score ?? 0;
+    } catch { return 0; }
   };
 
+  // ── Stream AI response ──
   const streamAIResponse = async (currentMessages: Message[]) => {
     setIsLoading(true);
-    setStatus("AI PROCESSING...");
+    setStatus("AI THINKING...");
     setAiResponse("");
     setAnswerReady(false);
     setPendingAnswer("");
-    waitingForSubmitRef.current = false;
+    setSubmitError("");
+    clearSilenceTimer();
+    setSilenceWarning(false);
     let fullResponse = "";
 
     try {
       const res = await fetch("/api/interview", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: currentMessages, topic: config.topic }),
+        body: JSON.stringify({
+          messages: currentMessages,
+          topic: config.topic,
+          level: config.level,
+          strictTopic: config.strictTopic,
+        }),
       });
 
       const reader = res.body?.getReader();
@@ -259,16 +312,25 @@ export default function InterviewScreen({ config, onComplete }: InterviewScreenP
           if (line.startsWith("data: ") && line !== "data: [DONE]") {
             try {
               const data = JSON.parse(line.slice(6));
-              fullResponse += data.text;
-              setAiResponse(fullResponse);
+              if (data.text) {
+                fullResponse += data.text;
+                setAiResponse(fullResponse);
+              }
             } catch {}
           }
         }
       }
 
       const cleanQuestion = fullResponse.replace("INTERVIEW_COMPLETE", "").trim();
-      setCurrentQuestion(cleanQuestion);
 
+      // Guard: empty response
+      if (!cleanQuestion && !fullResponse.includes("INTERVIEW_COMPLETE")) {
+        setIsLoading(false);
+        setStatus("YOUR TURN — SPEAK OR TYPE");
+        return;
+      }
+
+      setCurrentQuestion(cleanQuestion);
       const newMessages: Message[] = [
         ...currentMessages,
         { role: "assistant", content: fullResponse },
@@ -277,72 +339,82 @@ export default function InterviewScreen({ config, onComplete }: InterviewScreenP
       setAiResponse("");
       setQuestionCount((q) => q + 1);
 
-      if (!fullResponse.includes("INTERVIEW_COMPLETE")) {
-        setQAPairs((prev) => [
-          ...prev,
-          { question: cleanQuestion, answer: "", score: null, timestamp: Date.now() },
-        ]);
+      // Add QA pair — only if question is valid and not duplicate
+      if (!fullResponse.includes("INTERVIEW_COMPLETE") && cleanQuestion.length > 5) {
+        setQAPairs((prev) => {
+          const alreadyExists = prev.some((p) => p.question === cleanQuestion);
+          if (alreadyExists) return prev;
+          return [...prev, { question: cleanQuestion, answer: "", score: null, timestamp: Date.now() }];
+        });
       }
 
+      // Interview complete
       if (fullResponse.includes("INTERVIEW_COMPLETE")) {
+        if (isCompletingRef.current) return;
+        isCompletingRef.current = true;
         setStatus("INTERVIEW COMPLETE — GENERATING REPORT...");
         setIsLoading(false);
-        await speak(fullResponse);
+        await speak(cleanQuestion);
         setTimeout(() => onComplete(newMessages), 1500);
         return;
       }
 
       setIsLoading(false);
-      setStatus("AI SPEAKING... (STOP ⏹ TO INTERRUPT)");
-      await speak(fullResponse);
+      setStatus("AI SPEAKING... (⏹ TO STOP)");
+      await speak(cleanQuestion);
 
-      // Speaking ke baad wait karo — user ka answer aane do
-      setStatus("YOUR TURN — SPEAK YOUR ANSWER");
+      setStatus("YOUR TURN — SPEAK OR TYPE");
       if (!timerActive) setTimerActive(true);
+      startSilenceTimer();
     } catch (err) {
-      console.error(err);
+      console.error("streamAIResponse error:", err);
       setIsLoading(false);
-      setStatus("ERROR — RETRY");
+      setStatus("ERROR — PLEASE RETRY");
     }
   };
-
+ const interviewStartedRef = useRef(false);
   const startInterview = async () => {
+    if (interviewStartedRef.current) return; // double call block
+    interviewStartedRef.current = true;
     setStatus("CONNECTING TO ARIA...");
     await new Promise((r) => setTimeout(r, 800));
     await streamAIResponse([]);
   };
 
-  // Yeh tab call hoga jab user Submit dabayega
+  // ── Submit answer ──
   const submitAnswer = async () => {
     const finalAnswer = pendingAnswer.trim();
-    if (!finalAnswer) return;
+    if (!finalAnswer || finalAnswer.length < 3) {
+      setSubmitError("⚠ Please answer first — cannot submit blank!");
+      setTimeout(() => setSubmitError(""), 3000);
+      return;
+    }
 
+    if (isLoading) return;
+    setSubmitError("");
     setAnswerReady(false);
     setPendingAnswer("");
-    waitingForSubmitRef.current = false;
+    clearSilenceTimer();
+    setSilenceWarning(false);
     setStatus("PROCESSING YOUR ANSWER...");
 
     const userMessage: Message = { role: "user", content: finalAnswer };
     const updatedMessages = [...messages, userMessage];
     setMessages(updatedMessages);
 
-    // Last QA pair update karo
     const lastQ = currentQuestion;
     setQAPairs((prev) => {
       const updated = [...prev];
-      if (updated.length > 0) {
-        updated[updated.length - 1].answer = finalAnswer;
-      }
+      if (updated.length > 0) updated[updated.length - 1].answer = finalAnswer;
       return updated;
     });
 
-    // Score background mein
     scoreAnswer(lastQ, finalAnswer).then((score) => {
       setQAPairs((prev) => {
         const updated = [...prev];
-        if (updated.length > 0) {
-          updated[updated.length - 1].score = score;
-        }
+        const idx = updated.findLastIndex((p) => p.answer === finalAnswer);
+        const realIdx = idx !== -1 ? updated.length - 1 - idx : -1
+        if (idx !== -1) updated[realIdx].score = score;
         return updated;
       });
     });
@@ -353,36 +425,42 @@ export default function InterviewScreen({ config, onComplete }: InterviewScreenP
   const startListening = () => {
     if (isListening || isAISpeaking || isLoading) return;
     synthRef.current?.cancel();
+    setSilenceWarning(false);
     setIsListening(true);
+    setSubmitError("");
     setStatus("LISTENING... SPEAK NOW");
+    startSilenceTimer();
     try { recognitionRef.current?.start(); } catch {}
   };
 
   const stopListening = () => {
     recognitionRef.current?.stop();
     setIsListening(false);
+    clearSilenceTimer();
   };
 
   const typeAnswer = () => {
-    const input = window.prompt("Type your answer (yeh current answer mein add ho jaayega):");
-    if (input) {
-      setPendingAnswer((prev) => (prev ? prev + " " + input : input));
+    const input = window.prompt("Type your answer:");
+    if (input && input.trim().length >= 3) {
+      setPendingAnswer((prev) => (prev ? prev + " " + input.trim() : input.trim()));
       setAnswerReady(true);
-      waitingForSubmitRef.current = true;
+      setSubmitError("");
       setStatus("ANSWER READY — PRESS SUBMIT");
+    } else if (input !== null) {
+      setSubmitError("⚠ Please type something — blank answer not allowed!");
+      setTimeout(() => setSubmitError(""), 3000);
     }
   };
 
   const clearAnswer = () => {
     setPendingAnswer("");
     setAnswerReady(false);
-    waitingForSubmitRef.current = false;
-    setStatus("YOUR TURN — SPEAK YOUR ANSWER");
+    setSubmitError("");
+    setStatus("YOUR TURN — SPEAK OR TYPE");
   };
 
   const formatTime = (s: number) => {
-    const m = Math.floor(s / 60);
-    const sec = s % 60;
+    const m = Math.floor(s / 60), sec = s % 60;
     return `${m.toString().padStart(2, "0")}:${sec.toString().padStart(2, "0")}`;
   };
 
@@ -390,10 +468,18 @@ export default function InterviewScreen({ config, onComplete }: InterviewScreenP
   const timerWarn = timeLeft < 180;
   const circumference = 2 * Math.PI * 36;
 
+  const levelColors: Record<string, string> = {
+    fresher: "var(--green)",
+    junior: "var(--cyan)",
+    mid: "var(--yellow)",
+    senior: "var(--red)",
+  };
+
   return (
     <div className="interview-layout">
-      {/* LEFT SIDE PANEL */}
+      {/* ── SIDE PANEL ── */}
       <div className="side-panel">
+
         {/* Timer */}
         <div className={`timer-card ${timerDanger ? "danger" : timerWarn ? "warn" : ""}`}>
           <div className="timer-label">TIME LEFT</div>
@@ -414,6 +500,20 @@ export default function InterviewScreen({ config, onComplete }: InterviewScreenP
           <div className="timer-limit">{config.timeLimit}m LIMIT</div>
         </div>
 
+        {/* Level Badge */}
+        <div className="level-badge-card">
+          <div className="level-badge-label">LEVEL</div>
+          <div className="level-badge-value" style={{ color: levelColors[config.level] }}>
+            {config.level.toUpperCase()}
+          </div>
+          <div className="level-badge-sub">
+            {config.level === "fresher" && "0 exp"}
+            {config.level === "junior" && "0–2 yrs"}
+            {config.level === "mid" && "2–5 yrs"}
+            {config.level === "senior" && "5+ yrs"}
+          </div>
+        </div>
+
         {/* Stats */}
         <div className="stats-card">
           <div className="stat-item">
@@ -423,7 +523,7 @@ export default function InterviewScreen({ config, onComplete }: InterviewScreenP
           <div className="stat-divider" />
           <div className="stat-item">
             <div className="stat-value" style={{
-              color: avgScore >= 70 ? "var(--green)" : avgScore >= 50 ? "var(--yellow)" : avgScore > 0 ? "var(--red)" : "var(--text-dim)"
+              color: avgScore >= 70 ? "var(--green)" : avgScore >= 50 ? "var(--yellow)" : avgScore > 0 ? "var(--red)" : "var(--text-dim)",
             }}>
               {avgScore || "—"}
             </div>
@@ -454,23 +554,18 @@ export default function InterviewScreen({ config, onComplete }: InterviewScreenP
                     el.play().catch(() => {});
                   }
                 }}
-                autoPlay
-                muted
-                playsInline
-                className="camera-feed"
+                autoPlay muted playsInline className="camera-feed"
               />
             ) : (
               <div className="camera-placeholder">
                 {cameraError ? "⚠ ACCESS DENIED" : "CAMERA OFF"}
               </div>
             )}
-            {cameraOn && (
-              <div className="camera-rec"><span className="rec-dot" />REC</div>
-            )}
+            {cameraOn && <div className="camera-rec"><span className="rec-dot" />REC</div>}
           </div>
         </div>
 
-        {/* Progress */}
+        {/* Progress dots */}
         <div className="progress-card">
           <div className="progress-label">QUESTIONS COMPLETED</div>
           <div className="q-dots">
@@ -481,11 +576,15 @@ export default function InterviewScreen({ config, onComplete }: InterviewScreenP
                 <div
                   key={i}
                   className={`q-dot ${done ? "done" : i === qaPairs.length - 1 ? "active" : ""}`}
-                  style={score !== null && score !== undefined ? {
-                    background: score >= 70 ? "var(--green)" : score >= 50 ? "var(--yellow)" : "var(--red)",
-                    borderColor: score >= 70 ? "var(--green)" : score >= 50 ? "var(--yellow)" : "var(--red)",
-                    color: "var(--bg)",
-                  } : {}}
+                  style={
+                    score !== null && score !== undefined
+                      ? {
+                          background: score >= 70 ? "var(--green)" : score >= 50 ? "var(--yellow)" : "var(--red)",
+                          borderColor: score >= 70 ? "var(--green)" : score >= 50 ? "var(--yellow)" : "var(--red)",
+                          color: "var(--bg)",
+                        }
+                      : {}
+                  }
                   title={score !== null && score !== undefined ? `Q${i + 1}: ${score}/100` : `Q${i + 1}`}
                 >
                   {i + 1}
@@ -494,10 +593,13 @@ export default function InterviewScreen({ config, onComplete }: InterviewScreenP
             })}
           </div>
         </div>
+
       </div>
 
-      {/* MAIN PANEL */}
+      {/* ── MAIN PANEL ── */}
       <div className="interview-main">
+
+        {/* Header */}
         <div className="interview-header">
           <div className="aria-badge">
             <span className="aria-dot" />
@@ -508,26 +610,43 @@ export default function InterviewScreen({ config, onComplete }: InterviewScreenP
           </div>
         </div>
 
-        {/* Visualizer + Stop AI button */}
+        {/* Visualizer */}
         <div className="visualizer">
           <ARIAVisualizer isActive={isAISpeaking} isListening={isListening} />
-          {isAISpeaking && (
-            <button className="stop-ai-btn" onClick={stopAI}>
-              ⏹ STOP AI
-            </button>
-          )}
+          <div className="viz-actions">
+            {isAISpeaking && (
+              <button className="viz-action-btn stop-btn" onClick={stopAI}>
+                ⏹ STOP AI
+              </button>
+            )}
+            {!isAISpeaking && !isLoading && lastSpokenTextRef.current && (
+              <button className="viz-action-btn replay-btn" onClick={replayQuestion}>
+                🔁 REPLAY QUESTION
+              </button>
+            )}
+          </div>
         </div>
 
-        {/* Pending Answer Preview */}
-        {(pendingAnswer || answerReady) && (
+        {/* Silence warning */}
+        {silenceWarning && !isAISpeaking && !isLoading && (
+          <div className="silence-warning">
+            ⏳ No answer detected — speak or type. Press 🔁 to replay the question.
+          </div>
+        )}
+
+        {/* Answer preview */}
+        {pendingAnswer && (
           <div className="answer-preview">
             <div className="answer-preview-header">
               <span>▶ YOUR ANSWER (PREVIEW)</span>
               <button className="clear-btn" onClick={clearAnswer}>✕ CLEAR</button>
             </div>
-            <p className="answer-preview-text">{pendingAnswer || "..."}</p>
+            <p className="answer-preview-text">{pendingAnswer}</p>
           </div>
         )}
+
+        {/* Submit error */}
+        {submitError && <div className="submit-error">{submitError}</div>}
 
         {/* Q&A Log */}
         <div className="qa-log">
@@ -544,10 +663,13 @@ export default function InterviewScreen({ config, onComplete }: InterviewScreenP
                     <span className="qa-a-label">▶ YOU</span>
                     <p>{pair.answer}</p>
                     {pair.score !== null && (
-                      <div className="qa-score" style={{
-                        color: pair.score >= 70 ? "var(--green)" : pair.score >= 50 ? "var(--yellow)" : "var(--red)",
-                        borderColor: pair.score >= 70 ? "var(--green)" : pair.score >= 50 ? "var(--yellow)" : "var(--red)",
-                      }}>
+                      <div
+                        className="qa-score"
+                        style={{
+                          color: pair.score >= 70 ? "var(--green)" : pair.score >= 50 ? "var(--yellow)" : "var(--red)",
+                          borderColor: pair.score >= 70 ? "var(--green)" : pair.score >= 50 ? "var(--yellow)" : "var(--red)",
+                        }}
+                      >
                         {pair.score}/100
                       </div>
                     )}
@@ -556,12 +678,19 @@ export default function InterviewScreen({ config, onComplete }: InterviewScreenP
                   <div className="qa-answer pending">
                     <span className="qa-a-label">▶ YOU</span>
                     <p className="pending-text">
-                      {pendingAnswer
-                        ? pendingAnswer
-                        : transcript
-                        ? <><span style={{ color: "var(--cyan)" }}>{transcript}</span><span className="cursor-blink"> █</span></>
-                        : <span className="waiting-text">Waiting for your answer<span className="dots-anim">...</span></span>
-                      }
+                      {pendingAnswer ? (
+                        pendingAnswer
+                      ) : transcript ? (
+                        <>
+                          <span style={{ color: "var(--cyan)" }}>{transcript}</span>
+                          <span className="cursor-blink"> █</span>
+                        </>
+                      ) : (
+                        <span className="waiting-text">
+                          Waiting for your answer
+                          <span className="dots-anim">...</span>
+                        </span>
+                      )}
                     </p>
                   </div>
                 ) : null}
@@ -569,6 +698,7 @@ export default function InterviewScreen({ config, onComplete }: InterviewScreenP
             </div>
           ))}
 
+          {/* Streaming AI response */}
           {aiResponse && (
             <div className="qa-pair streaming-pair">
               <div className="qa-number">Q{qaPairs.length + 1}</div>
@@ -587,12 +717,12 @@ export default function InterviewScreen({ config, onComplete }: InterviewScreenP
               <span className="dots-anim">...</span>
             </div>
           )}
+
           <div ref={messagesEndRef} />
         </div>
 
         {/* Controls */}
         <div className="controls">
-          {/* Mic / Stop Listening */}
           <button
             className={`mic-btn ${isListening ? "active" : ""} ${isAISpeaking || isLoading ? "disabled" : ""}`}
             onClick={isListening ? stopListening : startListening}
@@ -600,35 +730,29 @@ export default function InterviewScreen({ config, onComplete }: InterviewScreenP
           >
             {isListening ? <><span>⏹</span> STOP MIC</> : <><span>🎙</span> SPEAK</>}
           </button>
-
-          {/* Type Answer */}
           <button className="text-btn" onClick={typeAnswer} disabled={isAISpeaking || isLoading}>
             ⌨ TYPE
           </button>
-
-          {/* SUBMIT — sirf tab dikhega jab answer ready ho */}
           {answerReady && (
             <button className="submit-btn" onClick={submitAnswer}>
               ✓ SUBMIT
             </button>
           )}
-
-          {/* End interview */}
           <button className="skip-btn" onClick={() => onComplete(messages)} disabled={isLoading}>
             ⏭ END
           </button>
         </div>
+
       </div>
     </div>
   );
 }
 
 function ARIAVisualizer({ isActive, isListening }: { isActive: boolean; isListening: boolean }) {
-  const bars = Array.from({ length: 24 });
   return (
     <div className={`aria-viz ${isActive ? "speaking" : ""} ${isListening ? "listening" : ""}`}>
       <div className="viz-bars">
-        {bars.map((_, i) => (
+        {Array.from({ length: 24 }).map((_, i) => (
           <div key={i} className="viz-bar" style={{ animationDelay: `${(i * 0.05) % 1}s` }} />
         ))}
       </div>
